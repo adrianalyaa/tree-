@@ -1,0 +1,567 @@
+"""
+Prediksi Harga Mobil Bekas - Streamlit
+Tiga cara prediksi sekaligus : Decision Tree, Random Forest, Gradient Boosting.
+
+Menjalankan lokal :
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Dataset (quikr_car.csv) dicari dengan urutan :
+    1. file quikr_car.csv di folder yang sama dengan app.py (atau folder data/)
+    2. unduh otomatis dari Kaggle lewat kagglehub
+    3. upload manual lewat halaman utama aplikasi
+"""
+import importlib
+import importlib.util
+import os
+import subprocess
+import sys
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Prediksi Harga Mobil Bekas", page_icon="🚗", layout="wide")
+
+
+def pastikan_paket(modul, paket_pip):
+    """Pasang paket secara otomatis bila belum ada di server.
+
+    Biasanya paket dipasang lewat requirements.txt. Fungsi ini hanya jaring pengaman
+    kalau file tersebut tidak terbaca saat deploy (ModuleNotFoundError).
+    """
+    if importlib.util.find_spec(modul) is not None:
+        return
+    with st.spinner(f"Memasang {paket_pip} (hanya sekali, sekitar 1 menit)..."):
+        hasil = subprocess.run(
+            [sys.executable, "-m", "pip", "install", paket_pip],
+            capture_output=True, text=True,
+        )
+    if hasil.returncode != 0:
+        st.error(
+            f"Paket `{paket_pip}` belum terpasang dan pemasangan otomatis gagal. "
+            "Pastikan file `requirements.txt` ada di folder yang sama dengan `app.py` di repo GitHub, "
+            "lalu reboot app."
+        )
+        st.code(hasil.stderr[-1500:])
+        st.stop()
+    importlib.invalidate_caches()
+
+
+pastikan_paket("sklearn", "scikit-learn>=1.4")
+
+from sklearn.compose import ColumnTransformer  # noqa: E402
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor  # noqa: E402
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  # noqa: E402
+from sklearn.model_selection import GridSearchCV, train_test_split  # noqa: E402
+from sklearn.pipeline import Pipeline  # noqa: E402
+from sklearn.preprocessing import OneHotEncoder  # noqa: E402
+from sklearn.tree import DecisionTreeRegressor  # noqa: E402
+
+FITUR_KATEGORI = ["company", "model", "fuel_type"]
+FITUR_ANGKA = ["year", "kms"]
+TARGET = "Price"
+MODEL_LAIN = "(model lain, ketik sendiri)"
+NAMA_MODEL = ["Decision Tree", "Random Forest", "Gradient Boosting"]
+
+LOKASI_CSV = ["quikr_car.csv", os.path.join("data", "quikr_car.csv")]
+
+
+# ----------------------------------------------------------------------------
+# Memuat & membersihkan data
+# ----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def baca_csv(sumber):
+    return pd.read_csv(sumber, dtype=str)
+
+
+@st.cache_data(show_spinner="Mengunduh dataset dari Kaggle...")
+def unduh_kaggle():
+    import kagglehub
+
+    path = kagglehub.dataset_download("muhammadmusharraf444/used-car-price-prediction-dataset")
+    return pd.read_csv(os.path.join(path, "quikr_car.csv"), dtype=str)
+
+
+def muat_data_mentah():
+    for lokasi in LOKASI_CSV:
+        if os.path.exists(lokasi):
+            return baca_csv(lokasi)
+    try:
+        return unduh_kaggle()
+    except Exception:
+        pass
+
+    st.warning(
+        "Dataset `quikr_car.csv` tidak ditemukan dan tidak bisa diunduh otomatis. "
+        "Upload file CSV-nya di bawah ini."
+    )
+    unggahan = st.file_uploader("Upload quikr_car.csv", type="csv")
+    if unggahan is None:
+        st.stop()
+    return baca_csv(unggahan)
+
+
+@st.cache_data(show_spinner=False)
+def bersihkan_data(mentah):
+    """Pembersihan sama persis dengan notebook (bagian persiapan data)."""
+    data = mentah.copy()
+    data["year"] = pd.to_numeric(data["year"], errors="coerce")
+    data["Price"] = pd.to_numeric(data["Price"].str.replace(",", "", regex=False), errors="coerce")
+    data["kms"] = pd.to_numeric(
+        data["kms_driven"].str.replace(",", "", regex=False).str.extract(r"(\d+)")[0],
+        errors="coerce",
+    )
+
+    data = data.dropna(subset=["name", "company", "year", "Price", "kms", "fuel_type"]).drop_duplicates()
+    data["model"] = data["name"].str.split().str[:3].str.join(" ")
+
+    q1, q3 = data["Price"].quantile([0.25, 0.75])
+    batas_atas = q3 + 1.5 * (q3 - q1)
+    data = data[(data["Price"] <= batas_atas) & (data["kms"] <= 200_000)].reset_index(drop=True)
+    return data, float(batas_atas)
+
+
+# ----------------------------------------------------------------------------
+# Training 3 model
+# ----------------------------------------------------------------------------
+def buat_pipeline(estimator):
+    pre = ColumnTransformer(
+        [("kategori", OneHotEncoder(handle_unknown="ignore"), FITUR_KATEGORI)],
+        remainder="passthrough",
+    )
+    return Pipeline([("preprocess", pre), ("model", estimator)])
+
+
+@st.cache_resource(show_spinner=False)
+def latih_semua_model(data):
+    X = data[FITUR_KATEGORI + FITUR_ANGKA]
+    y = data[TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    kandidat = {
+        "Decision Tree": (
+            DecisionTreeRegressor(random_state=42),
+            {"max_depth": [6, 8, 10, 12, None], "min_samples_leaf": [2, 3, 5, 10]},
+        ),
+        "Random Forest": (
+            RandomForestRegressor(random_state=42, n_jobs=-1),
+            {
+                "n_estimators": [200],
+                "max_depth": [10, None],
+                "min_samples_leaf": [1, 2, 3],
+                "max_features": [0.3, 0.5, 1.0],
+            },
+        ),
+        "Gradient Boosting": (
+            GradientBoostingRegressor(random_state=42),
+            {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [2, 3, 4]},
+        ),
+    }
+
+    model, metrik, param_terbaik, pred_test, penting = {}, [], {}, {}, {}
+    for nama, (estimator, grid) in kandidat.items():
+        pencarian = GridSearchCV(
+            buat_pipeline(estimator),
+            {f"model__{k}": v for k, v in grid.items()},
+            cv=5,
+            scoring="neg_mean_absolute_error",
+            n_jobs=-1,
+        )
+        pencarian.fit(X_train, y_train)
+        terbaik = pencarian.best_estimator_
+
+        p_train, p_test = terbaik.predict(X_train), terbaik.predict(X_test)
+        metrik.append(
+            {
+                "Model": nama,
+                "R2 Training": r2_score(y_train, p_train),
+                "R2 Testing": r2_score(y_test, p_test),
+                "MAE Training": mean_absolute_error(y_train, p_train),
+                "MAE Testing": mean_absolute_error(y_test, p_test),
+                "RMSE Testing": float(np.sqrt(mean_squared_error(y_test, p_test))),
+            }
+        )
+        model[nama] = terbaik
+        param_terbaik[nama] = {k.replace("model__", ""): v for k, v in pencarian.best_params_.items()}
+        pred_test[nama] = p_test
+
+        nama_fitur = terbaik.named_steps["preprocess"].get_feature_names_out()
+        nilai = pd.Series(terbaik.named_steps["model"].feature_importances_, index=nama_fitur)
+        penting[nama] = nilai.groupby(_kolom_asal).sum()
+
+    metrik = pd.DataFrame(metrik).set_index("Model")
+    metrik["Selisih R2 (Train - Test)"] = metrik["R2 Training"] - metrik["R2 Testing"]
+
+    return {
+        "model": model,
+        "metrik": metrik,
+        "param": param_terbaik,
+        "penting": pd.DataFrame(penting).fillna(0),
+        "X_train": X_train,
+        "y_train": y_train,
+        "y_test": y_test,
+        "pred_test": pred_test,
+    }
+
+
+def _kolom_asal(nama):
+    """Gabungkan hasil One-Hot (mis. company_Hyundai) kembali ke kolom asalnya."""
+    nama = nama.replace("kategori__", "").replace("remainder__", "")
+    for kolom in FITUR_KATEGORI:
+        if nama.startswith(kolom + "_"):
+            return kolom
+    return nama
+
+
+# ----------------------------------------------------------------------------
+# Prediksi
+# ----------------------------------------------------------------------------
+def prediksi_semua(hasil, merk, nama_mobil, tahun, kms, bbm):
+    model_mobil = " ".join(nama_mobil.split()[:3])
+    baris = pd.DataFrame(
+        [{"company": merk, "model": model_mobil, "fuel_type": bbm, "year": float(tahun), "kms": float(kms)}]
+    )
+
+    keluaran = {}
+    for nama, pipeline in hasil["model"].items():
+        harga = max(float(pipeline.predict(baris)[0]), 0.0)
+        rendah = tinggi = None
+        pre, estimator = pipeline.named_steps["preprocess"], pipeline.named_steps["model"]
+
+        if nama == "Random Forest":
+            # Sebaran prediksi dari tiap pohon
+            angka = pre.transform(baris)
+            per_pohon = np.array([p.predict(angka)[0] for p in estimator.estimators_])
+            rendah, tinggi = np.percentile(per_pohon, [10, 90])
+            keterangan = "Rentang prediksi antar pohon (P10 - P90)"
+        elif nama == "Decision Tree":
+            # Harga data training yang jatuh di daun yang sama
+            daun = estimator.apply(pre.transform(baris))[0]
+            daun_train = estimator.apply(pre.transform(hasil["X_train"]))
+            mirip = hasil["y_train"][daun_train == daun]
+            if len(mirip) > 1:
+                rendah, tinggi = mirip.min(), mirip.max()
+            keterangan = f"Rentang mobil serupa di data training ({len(mirip)} data)"
+        else:
+            keterangan = "Boosting tidak punya rentang bawaan"
+
+        keluaran[nama] = {"harga": harga, "rendah": rendah, "tinggi": tinggi, "keterangan": keterangan}
+    return keluaran
+
+
+def rp(nilai):
+    return "Rp " + f"{nilai:,.0f}".replace(",", ".")
+
+
+def inr(nilai):
+    return f"INR {nilai:,.0f}"
+
+
+# ----------------------------------------------------------------------------
+# Teks penjelasan (diambil dari notebook)
+# ----------------------------------------------------------------------------
+PENJELASAN = {
+    "Decision Tree": {
+        "ikon": "🌳",
+        "ringkas": "Satu pohon keputusan",
+        "cara": (
+            "Membuat satu pohon pertanyaan Ya/Tidak (mis. \"dibuat tahun 2012 atau lebih lama?\", "
+            "\"merk Maruti?\") sampai tiba di satu daun. Prediksinya adalah rata-rata harga mobil "
+            "pada data training yang jatuh di daun yang sama."
+        ),
+        "plus": "Mudah dipahami dan dijelaskan, alurnya bisa digambar.",
+        "minus": "Mudah menghafal data (overfitting) dan hasilnya bisa berubah jauh bila data sedikit berubah.",
+    },
+    "Random Forest": {
+        "ikon": "🌲",
+        "ringkas": "Banyak pohon, hasilnya dirata-rata",
+        "cara": (
+            "Membangun banyak pohon keputusan. Tiap pohon dilatih dari sampel data dan subset fitur "
+            "yang berbeda, lalu hasil semua pohon dirata-rata. Sebaran hasil antar pohon dipakai "
+            "sebagai rentang prediksi."
+        ),
+        "plus": "Biasanya lebih stabil daripada satu pohon.",
+        "minus": "Lebih lambat dilatih dan sulit dijelaskan, karena tidak ada satu pohon yang bisa digambar sebagai alur keputusan.",
+    },
+    "Gradient Boosting": {
+        "ikon": "🚀",
+        "ringkas": "Pohon kecil yang saling memperbaiki",
+        "cara": (
+            "Membangun pohon-pohon kecil secara berurutan. Setiap pohon baru khusus memperbaiki "
+            "kesalahan pohon sebelumnya, lalu semua hasilnya dijumlahkan."
+        ),
+        "plus": "Sering paling akurat untuk data tabel seperti ini.",
+        "minus": "Paling sensitif terhadap pengaturan parameter dan bisa overfitting bila pohonnya terlalu banyak.",
+    },
+}
+
+
+def kekuatan_korelasi(r):
+    r = abs(r)
+    for batas, nama in [(0.2, "sangat lemah"), (0.4, "lemah"), (0.6, "sedang"), (0.8, "kuat")]:
+        if r < batas:
+            return nama
+    return "sangat kuat"
+
+
+def kalimat_korelasi(label, r, teks_positif, teks_negatif):
+    arah = "positif" if r >= 0 else "negatif"
+    if abs(r) < 0.2:
+        tafsir = "Hubungan linearnya hampir tidak terlihat."
+    else:
+        tafsir = teks_positif if r >= 0 else teks_negatif
+    return f"- **{label}** : korelasi {r:+.2f} ({kekuatan_korelasi(r)}, {arah}). {tafsir}"
+
+
+def analisis_overfitting(selisih):
+    if selisih > 0.2:
+        return "indikasi overfitting cukup kuat"
+    if selisih > 0.1:
+        return "ada indikasi overfitting"
+    return "tidak terlihat overfitting yang besar"
+
+
+# ----------------------------------------------------------------------------
+# Tampilan
+# ----------------------------------------------------------------------------
+st.title("🚗 Prediksi Harga Mobil Bekas")
+st.caption("Masukkan data mobil, lalu lihat perkiraan harganya dari tiga cara prediksi sekaligus.")
+
+mentah = muat_data_mentah()
+data, batas_harga = bersihkan_data(mentah)
+
+with st.spinner("Melatih 3 model (hanya sekali saat pertama dibuka)..."):
+    hasil = latih_semua_model(data)
+
+metrik = hasil["metrik"]
+
+tab_prediksi, tab_model, tab_data = st.tabs(["🔮 Prediksi", "🧠 Tentang Model", "📊 Data & EDA"])
+
+# ============================ Tab 1 : Prediksi ================================
+with tab_prediksi:
+    st.markdown(
+        "**Cara pakai** : isi data mobil di bawah, lalu klik **Prediksi Harga**. "
+        "Hasilnya muncul dari **Decision Tree**, **Random Forest**, dan **Gradient Boosting** sekaligus."
+    )
+
+    kiri, kanan = st.columns(2)
+    with kiri:
+        daftar_merk = sorted(data["company"].unique())
+        merk = st.selectbox("Merk", daftar_merk, index=daftar_merk.index("Maruti") if "Maruti" in daftar_merk else 0)
+
+        model_merk = data.loc[data["company"] == merk, "model"].value_counts().index.tolist()
+        pilihan_model = st.selectbox("Model mobil", model_merk + [MODEL_LAIN])
+        if pilihan_model == MODEL_LAIN:
+            nama_mobil = st.text_input("Ketik nama/model mobil", placeholder=f"mis. {model_merk[0]}").strip()
+            if nama_mobil and not nama_mobil.lower().startswith(merk.lower()):
+                nama_mobil = f"{merk} {nama_mobil}"
+        else:
+            nama_mobil = pilihan_model
+
+        daftar_bbm = sorted(data["fuel_type"].unique())
+        bbm = st.selectbox("Jenis bahan bakar", daftar_bbm)
+
+    with kanan:
+        tahun_min, tahun_max = int(data["year"].min()), int(data["year"].max())
+        tahun = st.number_input(
+            "Tahun pembuatan", min_value=tahun_min, max_value=tahun_max,
+            value=min(max(2012, tahun_min), tahun_max), step=1,
+        )
+        kms = st.number_input("Jarak tempuh (km)", min_value=0, max_value=1_000_000, value=40_000, step=1_000)
+        kurs = st.number_input(
+            "Kurs 1 INR ke Rupiah", min_value=1.0, value=195.0, step=1.0,
+            help="Harga pada dataset dalam Rupee India (INR). Konversi bersifat perkiraan, sesuaikan dengan kurs terbaru.",
+        )
+
+    if st.button("Prediksi Harga", type="primary", width="stretch"):
+        if not nama_mobil:
+            st.error("Nama/model mobil belum diisi.")
+        else:
+            prediksi = prediksi_semua(hasil, merk, nama_mobil, tahun, kms, bbm)
+            model_dikenal = " ".join(nama_mobil.split()[:3]) in set(data["model"])
+
+            st.divider()
+            st.markdown(f"#### {nama_mobil} · {tahun} · {kms:,} km · {bbm}")
+            if not model_dikenal:
+                st.warning(
+                    "Model mobil ini tidak ada di dataset, jadi prediksi hanya memakai merk, tahun, "
+                    "jarak tempuh, dan bahan bakar. Akurasinya lebih rendah."
+                )
+
+            for kolom, nama in zip(st.columns(3), NAMA_MODEL):
+                p, info = prediksi[nama], PENJELASAN[nama]
+                with kolom.container(border=True):
+                    st.markdown(f"**{info['ikon']} {nama}**")
+                    st.caption(info["ringkas"])
+                    st.markdown(f"## {rp(p['harga'] * kurs)}")
+                    st.caption(inr(p["harga"]))
+                    if p["rendah"] is not None:
+                        st.write(f"Rentang : {inr(p['rendah'])} - {inr(p['tinggi'])}")
+                        st.caption(p["keterangan"])
+                    else:
+                        st.caption("Tidak ada rentang bawaan")
+
+            semua = np.array([prediksi[n]["harga"] for n in NAMA_MODEL])
+            rata, selisih = semua.mean(), semua.max() - semua.min()
+            st.info(
+                f"**Rata-rata ketiga model : {rp(rata * kurs)}** ({inr(rata)}). "
+                f"Selisih antara model tertinggi dan terendah sekitar {selisih / max(rata, 1) * 100:.0f}% dari rata-rata."
+            )
+            if selisih / max(rata, 1) > 0.3:
+                st.caption("Ketiga model cukup berbeda pendapat untuk mobil ini, jadi anggap hasilnya sebagai perkiraan kasar.")
+            else:
+                st.caption("Makin dekat hasil ketiga model, makin kuat perkiraannya.")
+
+    st.caption(
+        "Hasil prediksi adalah **perkiraan awal**, bukan harga pasti. Dataset tidak memuat kondisi mobil, "
+        "tipe transmisi, atau kapasitas mesin."
+    )
+
+# ============================ Tab 2 : Tentang Model ===========================
+with tab_model:
+    st.subheader("Tiga cara prediksi")
+    st.write(
+        "Ketiganya memakai fitur dan data yang sama (merk, model, bahan bakar, tahun, dan jarak tempuh), "
+        "sehingga perbedaan hasil murni berasal dari cara kerja algoritmanya."
+    )
+    for kolom, nama in zip(st.columns(3), NAMA_MODEL):
+        info = PENJELASAN[nama]
+        with kolom.container(border=True):
+            st.markdown(f"**{info['ikon']} {nama}**")
+            st.write(info["cara"])
+            st.markdown(f"✅ {info['plus']}")
+            st.markdown(f"⚠️ {info['minus']}")
+
+    st.subheader("Alur pembuatan model")
+    st.markdown(
+        "1. **Persiapan data** : data dibersihkan, fitur `model` dibuat dari 3 kata pertama nama mobil, outlier dibuang.\n"
+        "2. **Split data** : 80% training dan 20% testing.\n"
+        "3. **Training + tuning** : fitur kategori diubah dengan *One-Hot Encoding*, lalu `GridSearchCV` "
+        "(cross-validation 5 lipatan, kriteria MAE terkecil) mencari parameter terbaik.\n"
+        "4. **Evaluasi** : model diuji pada data testing yang belum pernah dilihat.\n"
+        "5. **Prediksi** : data mobil dari user diprediksi oleh ketiga model."
+    )
+
+    st.subheader("Evaluasi model")
+    tabel = metrik[["R2 Training", "R2 Testing", "Selisih R2 (Train - Test)", "MAE Testing", "RMSE Testing"]]
+    st.dataframe(
+        tabel.style.format(
+            {
+                "R2 Training": "{:.3f}",
+                "R2 Testing": "{:.3f}",
+                "Selisih R2 (Train - Test)": "{:.3f}",
+                "MAE Testing": "{:,.0f}",
+                "RMSE Testing": "{:,.0f}",
+            }
+        ),
+        width="stretch",
+    )
+    st.caption(
+        "R2 makin mendekati 1 makin baik. MAE dan RMSE dalam INR, makin kecil makin baik. "
+        "Selisih R2 training dan testing yang besar menandakan model menghafal data (overfitting)."
+    )
+
+    terbaik = metrik["R2 Testing"].idxmax()
+    st.subheader("Kesimpulan model")
+    poin = [
+        f"Dengan data yang sudah dibersihkan, model terbaik pada data test adalah **{terbaik}** "
+        f"(R2 {metrik.loc[terbaik, 'R2 Testing']:.3f}, MAE {metrik.loc[terbaik, 'MAE Testing']:,.0f} INR).",
+        "Pengecekan overfitting : "
+        + "; ".join(f"{n} {analisis_overfitting(metrik.loc[n, 'Selisih R2 (Train - Test)'])}" for n in NAMA_MODEL)
+        + ".",
+        (
+            "Nilai R2 belum tinggi, sesuai kesimpulan EDA : data ini terbatas (tidak ada fitur seperti "
+            "kondisi mobil, tipe transmisi, atau kapasitas mesin)."
+            if metrik.loc[terbaik, "R2 Testing"] < 0.7
+            else "Meski R2 sudah cukup baik, data ini tetap terbatas (tidak ada fitur seperti kondisi mobil, "
+            "tipe transmisi, atau kapasitas mesin), sehingga masih ada selisih dengan harga sebenarnya."
+        ),
+        "Hasil prediksi sebaiknya dipakai sebagai **perkiraan awal**, bukan harga pasti.",
+        "Untuk memperbaiki : kumpulkan data dan fitur lebih banyak.",
+    ]
+    st.markdown("\n".join(f"- {t}" for t in poin))
+
+    with st.expander("Fitur yang paling berpengaruh terhadap harga"):
+        st.bar_chart(hasil["penting"])
+    with st.expander("Parameter terbaik hasil GridSearchCV"):
+        for nama in NAMA_MODEL:
+            st.write(f"**{nama}**", hasil["param"][nama])
+
+# ============================ Tab 3 : Data & EDA ==============================
+with tab_data:
+    st.subheader("Tujuan analisis")
+    st.markdown(
+        "- Mencari faktor utama yang memengaruhi harga mobil bekas.\n"
+        "- Mencari pola dan hubungan antara harga, tahun pembuatan, jarak tempuh, jenis bahan bakar, dan model."
+    )
+
+    st.subheader("Informasi yang tersedia")
+    st.markdown(
+        "- Nama / model mobil\n- Merk (company)\n- Tahun pembuatan\n- Jenis bahan bakar\n- Jarak tempuh (km)\n- Harga (INR)"
+    )
+
+    st.subheader("Kondisi data mentah")
+    st.markdown(
+        "Dataset awalnya kotor :\n"
+        "- `year` mengandung nilai tidak valid (mis. \"zire\").\n"
+        "- `Price` mengandung nilai tidak valid (mis. \"Ask For Price\").\n"
+        "- `kms_driven` mengandung nilai tidak valid (mis. \"Petrol\") dan nilai kosong, begitu juga `fuel_type`."
+    )
+    st.write(
+        f"Dari **{len(mentah):,}** baris data mentah, tersisa **{len(data):,}** baris setelah membuang data "
+        f"kosong/tidak valid, duplikat, harga di atas {batas_harga:,.0f} INR (outlier IQR), dan jarak tempuh di atas 200.000 km."
+    )
+    with st.expander("Lihat contoh data bersih"):
+        st.dataframe(data[["name", "company", "year", "Price", "kms", "fuel_type"]].head(30), width="stretch")
+
+    st.subheader("Hubungan antar fitur numerik")
+    korelasi = data[["year", "Price", "kms"]].corr()
+    r_harga_tahun = korelasi.loc["year", "Price"]
+    r_harga_kms = korelasi.loc["Price", "kms"]
+    r_tahun_kms = korelasi.loc["year", "kms"]
+
+    tampil = korelasi.rename(index={"year": "Tahun", "Price": "Harga", "kms": "Jarak tempuh"},
+                             columns={"year": "Tahun", "Price": "Harga", "kms": "Jarak tempuh"})
+    st.dataframe(tampil.style.format("{:.2f}"), width="stretch")
+
+    st.markdown(
+        "\n".join(
+            [
+                kalimat_korelasi("Harga vs Tahun", r_harga_tahun,
+                                 "Mobil yang lebih baru cenderung lebih mahal.",
+                                 "Mobil yang lebih baru cenderung lebih murah."),
+                kalimat_korelasi("Harga vs Jarak tempuh", r_harga_kms,
+                                 "Jarak tempuh lebih besar cenderung diikuti harga lebih tinggi.",
+                                 "Jarak tempuh lebih besar cenderung diikuti harga lebih rendah."),
+                kalimat_korelasi("Tahun vs Jarak tempuh", r_tahun_kms,
+                                 "Mobil yang lebih baru cenderung punya jarak tempuh lebih besar.",
+                                 "Mobil yang lebih baru cenderung punya jarak tempuh lebih kecil."),
+            ]
+        )
+    )
+
+    st.subheader("Sebaran merk dan bahan bakar")
+    kiri, kanan = st.columns(2)
+    with kiri:
+        st.markdown("**Jumlah mobil per merk**")
+        st.bar_chart(data["company"].value_counts())
+    with kanan:
+        st.markdown("**Jumlah mobil per jenis bahan bakar**")
+        st.bar_chart(data["fuel_type"].value_counts())
+
+    merk_teratas = ", ".join(data["company"].value_counts().head(4).index)
+    st.markdown(f"Merk yang paling banyak muncul di dataset : **{merk_teratas}**.")
+
+    st.subheader("Kesimpulan EDA")
+    korelasi_terkuat = max(abs(r_harga_tahun), abs(r_harga_kms))
+    if korelasi_terkuat < 0.6:
+        st.write(
+            "Terlihat ada **hubungan** antar fitur, tetapi secara keseluruhan korelasinya belum cukup kuat. "
+            "Model yang dilatih hanya dari fitur yang tersedia tidak akan sangat akurat."
+        )
+    else:
+        st.write(
+            "Terlihat ada **hubungan** antar fitur dengan korelasi yang cukup kuat, "
+            "sehingga fitur yang tersedia sudah memberi sinyal yang berguna untuk memprediksi harga."
+        )
